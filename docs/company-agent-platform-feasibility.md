@@ -1,235 +1,200 @@
-# 基于 Pi 的公司级多 Agent 研发平台：源码评估与 PoC 计划
+# Paperclip + Pi：公司多 Agent 研发平台执行器接入方案
 
-> 状态：架构调研 / 待验证。基线：`leth0x01/pi` 的 `develop` 分支（2026-11-01）。
+> 文档状态：架构纠偏与后续 PoC 计划（2026-11-01）。
 >
-> 范围：只做架构分析和实验设计；未宣称完成部署、性能测试或跨进程可靠性验证。所有业务规则、资源限制和验收阈值均属于本项目的设计提案，而非 Pi 官方承诺。
+> **首要前提：公司 Agent 平台已经采用 Paperclip 作为控制面。Pi 是要接入 Paperclip 的执行器，不是另建一套多 Agent 平台。**
+>
+> 本文为 `leth0x01/pi` 的执行器接入与扩展方案，不取代现有 Paperclip 总体架构文档。该 Fork 是公开仓库；不得写入实际凭据、内部访问令牌、业务数据、真实内部拓扑 IP 或未获授权公开的信息。
 
-## 1. 结论与边界
+## 1. 已确定事实和不再讨论的方向
 
-**建议：使用 Pi 作为 Agent 执行核心，不把 Pi CLI 直接当作完整的公司研发管理平台。** 第一阶段在 Pi TypeScript SDK 上搭建独立的任务编排、权限、工件与审计层；并行验证实验性 `pi-durable`，通过故障恢复实测决定是否承担持久化运行时职责。
+- 控制面：**Paperclip**，负责组织、项目、Agent 定义、任务分配、心跳/唤醒、审批、预算、执行记录和进度展示。
+- 执行面：**Pi 为主要编码 Agent 运行时**；后续可以使用 OpenCode 等其他执行器，由 Paperclip 管理角色与任务归属。
+- 已有验证记录：Paperclip `v2026.1023.0` + `pi_local` + Pi（`@earendil-works/pi-coding-agent` 1.4.0）+ DeepSeek 已跑通基本任务调用。此前记录还涉及已有多 Agent 角色与审批等 Paperclip 配置。**这些是历史验证记录，本文未再次登录服务器或复验当前健康状态。**
+- GitHub Fork：`leth0x01/pi`，保留 `main` 与 `develop`。**尚未证明 Paperclip 目前使用的是 Fork 的二进制**：已安装的 Pi 和 GitHub 的 Fork 不自动等同。
+- 优先沿用 Paperclip 的官方 `pi_local` Adapter；不重新实现任务控制面、状态机、组织角色、心跳、审批、成本计量和通用 Agent 编排。
+- Paperclip Runner / ACP Pi 路线可以保留为未来评估项，**不要因其存在而擅自切换正在运行的 `pi_local`**。
 
-不要先改写 `packages/agent`、`packages/coding-agent` 或 `packages/ai`。优先使用扩展、SDK、MCP 与独立应用目录；保持与上游同步的可能性。
-
-当前范围：
-- 企业需求进入任务池，经产品/规划、技术负责人、开发、代码审查、测试、验收等专职 Agent 流转。
-- 同时支持长期维护多个 Git 仓库及新项目；代码修改通过隔离工作区和 Pull/Merge Request 审核。
-- 接入 Gitea/GitHub、Jenkins、文档检索与企业聊天工具；后续按需要接入 SVN 同步服务。
-- 保留审计、权限边界、失败恢复、上下文与长期知识，而非只实现「多个 Agent 相互聊天」。
-
-暂不纳入首个 PoC：无人监管生产部署、直接修改生产 SVN、完整企业级 Web 门户、跨多数据中心自动调度。
-
-## 2. 已核对的 Pi 源码能力
-
-| 模块 | 代码或文档证据 | 已有能力 | 当前评估 |
-|---|---|---|---|
-| `packages/ai` | [README](../packages/ai/README.md) | 统一模型/供应商接口、流式模型响应 | 直接复用 |
-| `packages/agent` | [Agent Core](../packages/agent/README.md)、[agent-loop.ts](../packages/agent/src/agent-loop.ts) | Agent Loop、状态、工具调用、事件流、并行/顺序执行策略、前后置钩子 | 直接复用 |
-| `packages/coding-agent` | [SDK](../packages/coding-agent/docs/sdk.md)、[sdk.ts](../packages/coding-agent/src/core/sdk.ts) | 创建会话、工具控制、会话事件、项目资源发现 | 第一阶段首选接入点 |
-| Sessions / Context | [Sessions](../packages/coding-agent/docs/sessions.md)、[How Pi Works](../packages/coding-agent/docs/how-pi-works.md) | JSONL 会话树、分支、续接、历史压缩 | 复用为执行会话；不等价于组织长期记忆 |
-| 扩展与 Skills | [Extensions](../packages/coding-agent/docs/extensions.md)、[Skills](../packages/coding-agent/docs/skills.md) | 注册工具、拦截事件、技能指令、扩展状态 | 优先扩展，避免核心 Fork |
-| MCP | [MCP](../packages/coding-agent/docs/mcp.md) | stdio/Streamable HTTP 接入工具与资源 | 连接开发工具；必须另加权限策略 |
-| RPC | [RPC](../packages/coding-agent/docs/rpc.md) | 通过 JSONL 子进程交互，支持事件/命令 | 非 Node 服务或进程隔离的备选 |
-| `packages/durable` | [Durable README](../packages/durable/README.md) | 实验性持久化 Harness、存储、任务/子任务、任务图、恢复机制 | 必须 PoC 验证，不能视为成熟生产编排平台 |
-| 运行安全 | [Security](../packages/coding-agent/docs/security.md)、[Containerization](../packages/coding-agent/docs/containerization.md) | Project trust 与隔离方案文档 | Pi **默认没有操作系统级权限沙箱**，安全边界须自行部署 |
-
-### 重要区分
-
-1. **Pi CLI 没有开箱即用的公司级多 Agent 交付流程**，不意味着 Pi 所有组件都没有子任务机制。`pi-durable` 明确提供 owned conversations（子 Agent 场景）、child tasks、task graph，以及 SQLite/JSONL 等存储适配器，但 README 标注为 **Experimental**，API 可能变化。
-2. `Agent` 的工具并行执行指的是同一次模型调用中的**工具并发**，不是跨项目、多角色、含审批和依赖的企业任务调度。
-3. 会话树、压缩摘要保存的是**会话上下文**。检索型长期知识、可信事实、项目决策、代码索引、权限与过期处理仍需在平台层实现。
-4. MCP 服务可被 Pi 调用，不代表具备租户隔离、凭据授权、工具风险分级或审计审批。
-5. Pi CLI/RPC/SDK 均是可用接口；对 TypeScript/Node 宿主，官方更推荐 SDK；进程隔离、异构语言宿主可采用 RPC。
-
-## 3. 建议架构
+## 2. 正确的系统关系
 
 ```text
-企业聊天 / Web / 工单 / API
-             |
-     需求入口 + 身份认证
-             |
-     Task API / 状态机 / 审批
-             |
-  Coordinator（确定性规则优先）
-      |            |
-  任务与工件库     事件、成本与审计
-      |
-  Agent Workers（各自工作区、各自权限）
-  ├─ PM / Planner: 需求拆解、验收标准
-  ├─ Architect: 方案评审、技术依赖
-  ├─ Developer: 实施、测试、提交 PR
-  ├─ Reviewer: 独立代码审查
-  └─ QA: 构建、测试、回归证据
-      |
-  Pi SDK / Pi Agent Core
-      |
-  Skills / Extensions / MCP
-      |
- Git 代码仓库 / Jenkins / 文档检索 / 受控工具
+                 员工 / 业务需求 / Web 或聊天入口
+                                |
+               +----------------v-----------------+
+               |          Paperclip               |
+               |  组织、项目、任务、Agent 管理      |
+               |  分配、审批、预算、心跳、运行记录   |
+               +----------------+-----------------+
+                                |
+                         adapter / execution target
+                                |
+                  +-------------+-------------+
+                  |                           |
+             pi_local                    opencode_local
+                  |                           |
+       +----------v----------+         +------v-------+
+       |  Pi Fork Executor   |         | 其他执行器    |
+       |  Agent Loop / Tools |         | 可选          |
+       |  Skills / MCP       |         +--------------+
+       |  Session / Context  |
+       +----------+----------+
+                  |
+       独立工作区 / 受限沙箱 / 任务专属权限
+                  |
+     GitLab/Gitea/GitHub · Jenkins · MCP · 项目知识
+                  |
+              结构化执行结果回到 Paperclip
 ```
 
-**核心原则：AI 负责分析与产出，平台状态机负责确定任务是否可以进入下一步。** 不让单个模型仅凭口头表示「已测试」或「已完成」就完成交付。
+**职责分界：** Paperclip 负责“给谁做、何时做、批准什么、预算多少、是否完成”；Pi 负责“拿到当前任务后如何思考、读写代码、使用工具、记录会话及提供执行证据”。
 
-### 3.1 角色职责和交付物
+任务是否通过验收应由 Paperclip 管理的流程及外部 CI/审核证据决定，而不能仅靠 Pi 自述。
 
-| 角色 | 输入 | 必须交付 | 禁止自行越权 |
-|---|---|---|---|
-| PM / Planner | 需求或 Issue | 需求范围、验收标准、未决问题 | 将不明确需求标记为验收通过 |
-| Architect | 需求、仓库结构 | 技术方案、影响范围、实施顺序 | 未获授权改动代码或生产配置 |
-| Developer | 已确认任务 | feature 分支、代码、测试、PR | 直接推送保护分支 |
-| Reviewer | PR、需求、测试结果 | 审查结论、风险、可复现问题 | 审批自己的实现 |
-| QA | 构建制品、测试计划 | 运行记录、失败日志、回归结论 | 用模型描述替代实际测试 |
-| Release（后续） | 已通过验收的版本 | 发布计划、变更记录、回滚步骤 | 未批准上线或读取生产密钥 |
+### 2.1 组件职责和禁止重复开发的能力
 
-一项跨端任务可包含 Android、iOS、服务端和固件子任务；先由 Coordinator 构建依赖图，再并行安排可独立实施的部分，统一集成测试。
+| 组件 | 应承担的职责 | 不应重复开发 |
+|---|---|---|
+| Paperclip | 业务任务、Agent 角色/配置、调度、唤醒、审批、预算、运行状态 | 不在 Pi 里再建一个任务看板和角色编排服务 |
+| `pi_local` Adapter | 启动 Pi、注入任务/工作区/模型配置、续接会话、采集输出与用量 | 不在 Fork 中实现一套新的 Paperclip Adapter，除非兼容性确实证明有缺口 |
+| Pi Fork | Agent Loop、模型、工具、Skills、扩展、任务内上下文、项目研发工作流 | 不把 `pi-durable` 提升为 Paperclip 上层调度器 |
+| Git 与 CI | 代码提交/MR/PR、构建与测试事实 | 不以 LLM 生成的“通过”替代真实 CI 结果 |
+| 项目知识库 | `AGENTS.md`、ADR、规格、工具与检索索引 | 不用会话压缩摘要代替经批准的长期知识 |
 
-### 3.2 任务状态
+## 3. Paperclip 与 Pi 的既有集成能力
 
-推荐最小状态机：
+Paperclip 官方 [Pi Adapter 文档](https://docs.paperclip.ing/reference/adapters/pi/) 对 `pi_local` 说明：
+- 执行 Pi CLI，并以 `provider/model` 选择模型；`model` 是必填项。
+- 使用 `--session` 在 Paperclip 心跳之间恢复同一个 Agent 的 Pi 会话。
+- 支持 `cwd`、`command`（默认 `pi`）、`thinking`、`promptTemplate`、`instructionsFilePath`、`env`、`timeoutSec`、`graceSec` 等配置。
+- 支持 `PAPERCLIP_PI_PROVIDERS` 创建托管的 `models.json`，并通过 `PI_CODING_AGENT_DIR` 指向托管目录。
+- 对远程 execution target，模型配置可同步到远程沙箱；远程运行前需要单独验证权限和工作区映射。
 
-`NEW -> TRIAGED -> SPEC_READY -> APPROVED -> IN_PROGRESS -> REVIEW -> TEST -> ACCEPTED -> DONE`
+之前提供的 Paperclip 本地 `@paperclipai/adapter-pi-local` 代码片段还确认：
+- 可注入 `PAPERCLIP_RUN_ID`、`PAPERCLIP_TASK_ID`、唤醒、审批与关联 Issue 等执行上下文；
+- 适配器有 Paperclip Skills 注入及 PATH 处理；
+- 存在 execution target、工作区映射、远端 managed home / bridge 的实现路径。
 
-任意阶段可流向 `BLOCKED`、`FAILED` 或 `NEEDS_REWORK`；回退原因、责任 Agent、工件和审批人必须持久化。不可使用自由文本作为唯一状态依据。
+**验证范围说明：** 看到这些代码路径不代表远程执行已经部署成功，也不代表本 Fork 已与该 Adapter 兼容。执行模式以当前 Paperclip 实例与实测为准。
 
-每个任务最少包括：
+Paperclip Runner 同样有 Pi 支持，但运行生命周期、ACP/Runner 设置与直接 `pi_local` 不同。参考 [Paperclip Runner 文档](https://docs.paperclip.ing/reference/adapters/paperclip-runner/)；本项目暂不迁移。
+
+## 4. Pi Fork 需要做什么
+
+### 4.1 首要任务：验证 Fork 能被现有 Paperclip 调起
+
+**目前风险不是缺少 SDK 编排，而是 Paperclip 调用的 Pi CLI 可能仍是系统安装的官方版本。**
+
+推荐过程：
+
+1. 在实验/开发环境从 `leth0x01/pi` 的 `develop` 分支取得源码，固定测试 commit，核对 `AGENTS.md`、`README.md`；使用 Node.js 24（源码要求 Node >=22.19）。
+2. 使用仓库已有脚本安装、构建并运行 Pi：`npm ci --ignore-scripts`，依 README 选择 `npm run build` 或模型数据已就绪时的 `npm run build:offline`，运行 `./pi-test.sh` 验证命令行。
+3. 检查 Paperclip **实际运行用户**的 `PATH`、`command -v pi`、`pi --version`，不能根据管理账号的环境推断服务进程使用哪个 Pi。
+4. 使用 Paperclip Agent 的 `pi_local` `command` 字段（绝对路径的可执行入口或固定版本启动包装脚本）指向 Fork 构建，先用实验 Agent，不直接替换现有生产 Agent 的 `pi`。
+5. 验证 `model` 配置、托管 `PI_CODING_AGENT_DIR`、`PAPERCLIP_PI_PROVIDERS`、Skills 注入、会话路径、JSONL 输出、取消、错误与超时处理。
+6. 提交一个低风险测试任务，在 Paperclip 中核对 run/task/agent 标识、Pi 实际构建版本、日志、用量、运行结果和后续 heartbeat resume。
+
+**回退方案：** 保留原 `pi_local` 的命令路径及配置，Fork 不兼容时恢复原运行时；不修改原 Paperclip 安装目录中的 `dist` 文件。
+
+### 4.2 其次：围绕 Pi 执行器做轻量定制
+
+优先级按从高到低：
+1. **Skills/工程规范**：需求阅读、代码实现、代码审查、测试取证、PR/MR 说明等，按 Paperclip 角色注入，不将角色调度写死到 Pi。
+2. **工具接入**：Pi MCP / 扩展对接受控 Git、CI Bridge、测试环境；默认限制破坏性操作。
+3. **执行证据规范**：每项工作关联 Paperclip task/run ID、仓库 commit、PR/MR、Jenkins job 和测试记录。
+4. **上下文与知识**：Pi session 用于任务内上下文；长期项目知识放在版本化的工程文档/知识服务，定期沉淀带来源、可审核的经验。
+5. **Fork 核心改动**：只有在 Skills、Extension、CLI 参数、Adapter 配置均无法满足，并且有复现测试时，才在 `develop` 修改 Pi 核心。
+
+### 4.3 不应在 Pi 仓库里新建的东西
+
+- 不创建独立 `apps/agent-platform/` 来重复实现 Task API / Coordinator / Agent 状态机。
+- 不重做 Paperclip 的角色、计划、任务依赖、预算、审批、提醒、心跳/唤醒和 Agent 运行面板。
+- 不让 Pi 自行决定业务任务的最终审核通过或生产发布。
+- 不为了“实现多 Agent”先引入 `pi-durable` 的另一层独立调度。它作为 Pi 内部高级执行实验可以单独验证，但不能替代 Paperclip 控制面。
+
+## 5. 角色协作的推荐方式
+
+在 **Paperclip 中**管理产品/规划、架构、开发、Reviewer、QA 等角色，并按任务状态和审批规则触发不同 Agent。Pi 只作为这些角色的一个执行 Provider。
+
+示例（逻辑流程，不是新建状态机）：
 
 ```text
-task_id, project_id, repository, base_commit, work_branch
-request, acceptance_criteria[], dependencies[], assignee_role
-status, attempt, deadline?, approval_policy
-artifact_refs[], tool_run_refs[], test_results[], review_refs[]
-created_at, updated_at, idempotency_key
+Paperclip 中创建需求和验收标准
+   -> Planner Agent（Pi）输出需求拆解/方案
+   -> Paperclip 审批与分配
+   -> Developer Agent（Pi）操作独立 worktree，提交 MR/PR
+   -> 现有 Git/CI 系统构建、测试
+   -> Reviewer / QA Agent 检查代码与实际测试证据
+   -> 结果与阻塞情况回写 Paperclip
+   -> 人工验收/批准合并或发布
 ```
 
-要求可根据 `task_id` 重建「谁执行了什么、使用了哪个提交、经过哪些门禁」。
+一项跨端业务需求可以由 Paperclip 分配 Android/iOS/服务端等 Agent；不同写入者须隔离工作区，避免代码覆盖。不要把多个 Pi 会话共用同一目录当作协同机制。
 
-## 4. 执行、上下文与长期记忆
+## 6. 安全和网络边界
 
-### 4.1 执行隔离
+Pi 官方 [Security](../packages/coding-agent/docs/security.md) 文档明确：Pi 默认以宿主用户权限执行，Project Trust 不是进程级安全隔离。必须在 Paperclip 远程执行目标、容器/沙箱和工作区层实施边界：
 
-- 每个写代码的 Agent 使用独立 Git worktree（或单独 clone），禁止多个 Agent 在同一工作目录同时写文件。
-- 每个执行单元使用独立容器/沙箱、限定资源和访问目录；默认无生产网络、无生产凭据。
-- 开发 Agent 只获取任务所需仓库的最小写权限；Review/QA 优先只读代码及制品。
-- 密钥在平台凭据管理层按任务注入，不写入 Prompt、仓库、会话摘要、长期知识。
-- 合并与发布至少需要独立审查、可追溯 CI 结果及明确批准；平台验收不能仅依赖 LLM 自评。
+- Paperclip 控制节点与 Agent 执行节点按规划分离。现阶段可先在非敏感实验环境验证，正式部署再拆分。
+- 每项写代码任务有独立的仓库工作区，按角色提供最低权限；Reviewer 不写入 Developer 的工作区。
+- Agent 执行节点禁止直达生产环境、编译隔离网和管理网。CI 通过既有批准的桥接接口调用。
+- 不把 Paperclip API Key、模型 Key、Git 密钥或生产凭据放进公开 Fork、AGENTS.md、日志和长期记忆。
+- 工具调用需审计，Jenkins 只开放白名单任务；发布与受限操作保留审批门禁。
+- 启用 Paperclip 官方远程执行隔离时，需要验证会话、工作区、技能和凭据是否正确传输以及能否在重启后恢复。
 
-### 4.2 四层记忆（平台设计，不是 Pi 开箱即用能力）
+## 7. 修正后的验证清单
 
-1. **工作记忆**：当前 Pi Agent 的短期上下文、工具响应和正在处理的任务。
-2. **情景记忆**：任务事件流、会话、PR 讨论、测试日志、失败与重试历史（按 `task_id` 可追溯）。
-3. **语义记忆**：已确认的项目规则、接口契约、架构决策、技术知识（带来源与生效范围）。
-4. **程序性记忆**：Skills、工程规范、自动化检查与可复用工具配置；建议版本化随仓库管理。
+| 阶段 | 具体目标 | 当前状态 |
+|---|---|---|
+| P0（已有基础） | Paperclip -> `pi_local` -> Pi -> DeepSeek 单任务链路 | 历史记录：已跑通；当前实例未复验 |
+| P0.5（下一步） | Paperclip 通过 `command` 使用 **本 Fork 的 Pi CLI**，验证版本、模型、Skills、日志与 session | 待执行 |
+| P1 | Paperclip 多角色分工 -> Pi 开发 -> Git MR/PR -> CI -> Reviewer/QA -> Paperclip 状态回写 | 待端到端验收 |
+| P2 | Pi 任务隔离、权限、恢复、超时/中断、成本与证据 | 待故障演练 |
+| P3 | 多项目并行、受控 Jenkins/内网服务、知识体系、可观测性 | 分步接入 |
 
-记忆写入策略：观察 -> 摘要/提取 -> 证据与权限校验 -> 去重/冲突处理 -> 发布为项目知识。默认只共享经审核的项目知识；个人会话或其他项目的敏感信息不得跨作用域自动传播。
+### P0.5 必须验收
 
-检索优先级：项目现行规范与代码 > 已批准的架构决策 > 当前任务记录 > 历史经验。任何摘要不能覆盖真实代码、测试输出与提交记录。
+- [ ] Paperclip 执行日志能证实实际调用 Fork 对应的 Pi CLI/commit；
+- [ ] 模型与 `PAPERCLIP_PI_PROVIDERS` 配置正确；
+- [ ] Paperclip task/run 标识传入 Pi，执行日志、usage 回传；
+- [ ] Skills 能正确发现并运行，`cwd` 为隔离测试工作区；
+- [ ] 任务跨心跳可恢复，终止和超时能正确回传状态；
+- [ ] 未触及其他 Agent 的工作区与不应访问的资源；
+- [ ] 回退为原 `pi_local` 后原执行链路仍正常。
 
-## 5. 两条技术路线与取舍
+### P1 必须验收
 
-| 方案 | 优点 | 风险 | 决策 |
-|---|---|---|---|
-| A. Pi SDK + 自研精简 Coordinator | API 清晰、便于按企业验收流程建模、可把状态和权限留在自有服务 | 需要自己做调度、恢复、幂等与审计 | **PoC 主线** |
-| B. pi-durable 承担持久运行时 + 外部治理层 | 已有任务、子任务、状态恢复、存储后端与任务图 | Experimental；需验证版本兼容、故障边界、跨进程拓扑、外部副作用恢复 | **PoC 并行实验** |
-| C. Pi RPC Worker + 外部调度 | 进程隔离、语言无关、日志流易接 | 进程生命周期、事件处理和恢复需额外实现 | 作为 A/B 的 Worker 备选 |
+- [ ] 一次真实需求生成可追踪的 commit + MR/PR；
+- [ ] Reviewer 与 Developer 分离，不由开发者 Agent 自我批准；
+- [ ] 测试失败阻断验收；返工后可再次提交结果；
+- [ ] CI 产物、日志与 Paperclip 任务可关联；
+- [ ] Paperclip 展示执行、审批和最终结论，Git/CI 保有权威工件记录。
 
-选型门槛：以实际断点恢复、重复操作防护、事件完整性、开发效率和长期维护成本决定，不因任何工具已部署而优先。
+## 8. 本 Fork 的仓库策略
 
-特别注意：`pi-durable` 文档明确一个进程拥有一个 storage，**不能未经验证就把单个 SQLite 文件当作多 Worker 共享队列**；生产分布式一致性、任务迁移与锁策略需要另行设计。调用 Jenkins、创建 PR、提交代码等外部副作用，必须通过业务幂等键及查询校验实现安全重试。
+- `main`：跟踪上游，尽量避免加入公司专属代码。
+- `develop`：经过验证的 Pi 执行器定制的集成分支。
+- `docs/agent-platform-feasibility`：当前调研文档 PR，完成评审后可合并到 `develop`。
+- 后续需求新开 `feature/paperclip-...`，从 `develop` 分出，提交 PR 后再合并。
+- 工程定制优先以独立 `extensions/`、`skills/`、`docs/` 或项目本身的 `.pi/` 配置实现；确有必要再修改上游包。
 
-## 6. PoC 环境与网络
+## 9. 推荐的下一实际动作
 
-建议先在单台 Linux 实验机运行 Coordinator + 一个或两个 Worker，CPU/内存容量按实际模型运行方式、并发工具和构建负载测量，暂不报未经测量的资源需求。Node.js 选已配置的 v24，满足仓库 `>=22.19` 要求。编译任务尽量交给专门 CI 节点，而非长期运行的 Agent 主机。
+**不是开发新的 Coordinator 或 Agent 平台 API，而是在 Paperclip 的现有 `pi_local` 上验证 Fork 可运行。**
 
-按现有公司网络规划执行以下原则（具体互通性与防火墙规则上线前实测）：
+最低交付：
+1. Fork Pi 固定版本的可执行入口；
+2. 一个 Paperclip 实验 Agent 指向该入口（不影响现有 Agent）；
+3. 一份端到端任务的运行证据（run/task、版本、日志、模型、Skills、用量及会话恢复）；
+4. 若出现兼容问题，定位是 Pi CLI 接口、Paperclip Adapter 解析、配置还是执行环境问题，再有针对性地修 Pi Fork 或提交 Paperclip upstream Issue/PR。
 
-- Agent 主机：受控访问 Git 服务及必要的外部模型 API。
-- 外网 Git：优先用既有 3 段或 40 段 Gitea/Git 路径与最小权限凭据。
-- 内网 254 段 SVN/Jenkins：经现有受控同步/构建入口完成交互，**不要**让 Agent Worker 为了方便直接跨网访问编译内网。
-- Jenkins：使用专门服务账号和参数受限 Job；Agent 只能请求构建、读取结果，不拥有 Jenkins 全局管理权。
-- Web/聊天入口：由入口服务认证用户，再映射权限到任务；不能把聊天消息当作系统命令执行。
+## 10. 参考资料
 
-PoC 的第一版可以只做单机内网试验，不开放公网管理 API。
+- Paperclip [Pi Adapter](https://docs.paperclip.ing/reference/adapters/pi/)
+- Paperclip [Adapters Overview](https://docs.paperclip.ing/reference/adapters/overview/)
+- Paperclip [Paperclip Runner](https://docs.paperclip.ing/reference/adapters/paperclip-runner/)
+- Pi [README](../README.md)、[AGENTS.md](../AGENTS.md)
+- Pi [SDK](../packages/coding-agent/docs/sdk.md)、[RPC](../packages/coding-agent/docs/rpc.md)
+- Pi [Extensions](../packages/coding-agent/docs/extensions.md)、[MCP](../packages/coding-agent/docs/mcp.md)
+- Pi [Sessions](../packages/coding-agent/docs/sessions.md)、[Security](../packages/coding-agent/docs/security.md)
 
-## 7. 分阶段实施与验收
-
-### P0：源码可运行与基线（先做）
-
-1. 从 `develop` 建独立试验分支，记录 Pi commit SHA、Node/npm 版本；按根目录 [AGENTS.md](../AGENTS.md) 和 [README](../README.md) 安装。
-2. `npm ci --ignore-scripts`、`npm run build:offline`（如模型数据尚未就绪，按仓库指导先补齐数据）、`npm run check`；记录错误，不把未运行当作通过。
-3. 通过 SDK 建立单个受控 Agent：只读列文件 -> 输出分析 -> 结束并释放 session。
-4. 用 RPC 做同任务的进程隔离对照，验证事件、退出和超时处理。
-
-验收：本地构建与检查日志可复现，至少一条 SDK 任务可产出包含 session ID 和 commit SHA 的记录。
-
-### P1：两 Agent 完整闭环（推荐第一个业务 PoC）
-
-选用一个低风险的真实 Git 项目，建立如下流程：
-
-`Issue -> Planner 拆解 -> Developer 建分支与修改 -> CI -> Reviewer 独立审查 -> QA 验证 -> 人工验收`
-
-最低要求：
-- Agent 自身不能合并开发分支；
-- 每次任务生成独立工作目录/分支；
-- PR、CI 日志、测试结果关联到同一个 task_id；
-- 测试失败自动进入 NEEDS_REWORK，阻断 DONE；
-- 可以中止任务、查看当前责任人和产出；
-- 对未授权写文件和访问非目标仓库的请求要拦截，并由沙箱限制。
-
-验收：一次成功任务、一次测试失败后返工、一次审批拒绝都能按预期流转。
-
-### P2：持久化与安全故障演练
-
-在隔离环境评估 `pi-durable`，至少验证：
-1. 模型请求过程中重启，恢复后没有丢失任务状态；
-2. 工具调用完成但提交状态前崩溃，重试不造成重复 PR、重复 Jenkins Job 等外部副作用；
-3. 父任务等待多个子任务，其中一项失败后，状态和取消传播可解释；
-4. 中止/恢复/重试后，任务事件与审计可完整回放；
-5. 两个不同项目的知识不会误共享，Agent 无法读取其他项目密钥；
-6. 会话历史压缩后仍可从原始记录找回验收证据。
-
-验收：有测试输入、运行日志、失败与恢复截图或结构化记录；若任一关键安全/幂等场景失败，则保持方案 A，不直接采用实验运行时。
-
-### P3：企业系统接入（在 P1、P2 通过后）
-
-逐项接入：Gitea/GitHub 工单 -> Jenkins 构建 -> 内网受控同步服务 -> 企业聊天通知 -> 最后才是 Web 门户与跨项目资源池。
-
-## 8. 首批建议开发文件（尚未创建）
-
-PoC 验证通过后，优先在 Fork 的独立应用目录开发，保持上游包不变：
-
-```text
-apps/agent-platform/
-  src/
-    api/              # 任务入口
-    orchestration/    # 状态机、依赖、审批、恢复
-    workers/          # Pi SDK/RPC 适配器
-    roles/            # 角色及输出结构
-    integrations/     # Git、CI、企业通知
-    memory/           # 来源、作用域、可信度
-    security/         # 凭据、沙箱和权限策略
-  test/
-  README.md
-```
-
-建议优先建立三个实现切片：
-- Slice 1：`task_id + state machine + SDK worker + 事件日志`；
-- Slice 2：`Git 分支/PR + Jenkins CI + Review/QA 门禁`；
-- Slice 3：`重启恢复 + 幂等 + 多 Agent 子任务 + 项目知识`。
-
-## 9. 风险清单与当前状态
-
-| 风险 | 控制手段 |
-|---|---|
-| 上游 Pi 更新造成大量合并冲突 | 优先外部 app/SDK/extension，不重写上游核心包 |
-| pi-durable 破坏性 API 变化 | 独立实验并锁定依赖版本，先做故障演练 |
-| 多 Agent 相互覆盖代码 | 按任务/Agent 隔离 worktree，保护主分支 |
-| 重试重复触发外部操作 | task_id/idempotency_key + 外部状态反查 |
-| 指令注入、工具越权 | 沙箱、最小凭据、网络白名单、人工门禁 |
-| 「模型说成功」被误判为成功 | 以 Git commit、CI、测试输出和审批记录为准 |
-| 上下文摘要丢失关键信息 | 原始事件保留，知识分层，有来源的决策才能写入长期知识 |
-| 大量模型调用造成预算失控 | 每任务 token/费用上限、重试预算、告警和终止条件 |
-
-**目前完成：** 按仓库文档和关键源码进行静态分析，形成实验路线。
-
-**尚未完成：** 实际部署、单元测试、CI、性能和安全实验；本文中的所有验收案例均是待执行事项。
-
-**下一项应执行的任务：** P0 最小 SDK 可运行样例与本地环境检查；随后开发 P1 的最小任务状态机和双 Agent 闭环。
+> 注意：本文仅修正文档和下一步计划；没有对正在运行的 Paperclip 实例做部署更改，也没有声称 Fork Pi 已接入成功。
